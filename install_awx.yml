@@ -1,0 +1,294 @@
+---
+# Based on various parts of:
+# https://docs.docker.com/install/linux/docker-ce/ubuntu/
+# https://github.com/ansible/awx/blob/devel/INSTALL.md
+# https://docs.gitlab.com/omnibus/docker/
+#
+# Config of AWX based on these notes: (Don't use it as an install guide!!)
+# https://www.howtoforge.com/how-to-install-ansible-awx-with-nginx-reverse-proxy-on-ubuntu-1804/
+
+- name: Install prerequisites
+  gather_facts: false
+  hosts: all
+  become: true
+  tasks:
+  - name: Install Python
+    raw: test -e /usr/bin/python || (sudo apt -y update && sudo apt install -y python-minimal)
+    changed_when: false
+    failed_when: false
+
+  - name: Gather facts
+    setup:
+
+  - name: Run a Full Upgrade
+    apt:
+      update_cache: yes
+      upgrade: full
+      autoremove: yes
+      autoclean: yes
+      force_apt_get: yes
+
+  - name: Install the Docker GPG Key
+    apt_key:
+      url: https://download.docker.com/linux/ubuntu/gpg
+      id: 9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+
+  - name: Install the Docker repo
+    apt_repository:
+      repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+      state: present
+      filename: docker-ce
+
+  - name: Install required software via Apt
+    apt:
+      update_cache: yes
+      name: ['docker-ce', 'docker-ce-cli', 'containerd.io', 'python-pip', 'nodejs', 'npm']
+      force_apt_get: yes
+
+  - name: Install pip packages
+    pip:
+      name: ['docker', 'docker-compose', 'ansible']
+
+  - name: Install extra pip packages
+    pip:
+      name: "{{ item }}"
+    loop:
+    - pyapi-gitlab      # Needed for gitlab_* modules below
+    - ansible-tower-cli # Needed for the tower_* modules below
+
+  - name: Install npm packages
+    npm:
+      name: npm
+      global: yes
+      state: latest
+
+- name: Install Gitlab
+  hosts: all
+  become: true
+  tasks:
+  - name: Check if Gitlab is up already
+    uri:
+      url: "http://127.0.0.1:1080/users/sign_in"
+      follow_redirects: none
+      method: GET
+    register: _result
+    failed_when: false
+    changed_when: false
+
+  - name: Record status
+    set_fact:
+      build_gitlab: "{{ _result.status <100 or _result.status > 399 }}"
+
+  - name: Create Gitlab Container
+    docker_container:
+      name: gitlab
+      image: gitlab/gitlab-ce:latest
+      restart: yes
+      state: started
+      published_ports:
+      - 1443:443
+      - 1080:80
+      - 1022:22
+      hostname: gitlab
+    when: build_gitlab
+
+  # Based on https://gist.github.com/mikeifomin/67e233cd461331de16707ef59a07e372
+  - name: Wait for gitlab to be up
+    uri:
+      url: "http://127.0.0.1:1080/users/sign_in"
+      follow_redirects: none
+      method: GET
+    register: _result
+    until: _result.status == 200
+    retries: 10000 # retry X times  
+    delay: 5 # pause for X sec b/w each call
+    when: build_gitlab
+
+  - name: Define docker command to run
+    set_fact:
+     batch_gitlab_actions: |
+        /opt/gitlab/bin/gitlab-rails console production <<'EOF'
+        u = User.first
+        u.password_automatically_set = false
+        u.password = '{{ password_key }}_Gitlab'
+        u.password_confirmation = '{{ password_key }}_Gitlab'
+        u.save
+        User.create(username: \"awx\", name: \"AWX\", email: \"awx@gitlab.local\", password: \"{{ password_key }}_Gitlab\", password_confirmation: \"{{ password_key }}_Gitlab\", confirmed_at: Time.now, confirmation_token: nil)
+        {% for user in users | dict2items %}
+        User.create(username: \"{{ user.key }}\", name: \"{{ user.value }}\", email: \"{{ user.key }}@gitlab.local\", password: \"{{ password_key }}_Gitlab\", password_confirmation: \"{{ password_key }}_Gitlab\", confirmed_at: Time.now, confirmation_token: nil)
+        {% endfor %}
+        EOF
+    when: build_gitlab
+
+  - name: Run password reset command in gitlab
+    raw: docker exec -i gitlab bash -c "{{ batch_gitlab_actions }}"
+    failed_when: docker_exec.rc != 0
+    register: docker_exec
+    when: build_gitlab
+
+  - name: Dump output
+    debug: 
+      var: docker_exec
+    when: build_gitlab and docker_exec.rc != 0
+
+#  - name: Create Gitlab Projects
+#    gitlab_project:
+#      server_url: http://127.0.0.1:1080
+#      validate_certs: false
+#      login_user: root
+#      login_password: "{{ password_key }}_Gitlab"
+#      name: "{{ item }}"
+#      issues_enabled: yes
+#      snippets_enabled: no
+#      wiki_enabled: no
+#      visibility_level: 20
+      
+- name: Install AWX
+  hosts: all
+  become: true
+  tasks:
+  - name: Check if AWX is up
+    uri:
+      url: "http://127.0.0.1"
+      follow_redirects: none
+      method: GET
+    register: _result
+    failed_when: false
+    changed_when: false
+
+  - name: Record status
+    set_fact:
+      build_awx: "{{ _result.status <100 or _result.status > 399 }}"
+
+  - name: Clone AWX repo
+    git:
+      repo: https://github.com/ansible/awx.git
+      dest: /opt/awx
+    failed_when: false
+    when: build_awx
+
+  - name: Configure AWX installer
+    lineinfile:
+      path: /opt/awx/installer/inventory
+      regexp: "^#?{{ item.key }}="
+      line: "{{ item.key }}={{ item.value }}"
+    when: build_awx
+    loop:
+    - key: "awx_web_hostname"
+      value: "awx"
+    - key: "pg_password"
+      value: "{{ lookup('password', 'pg_password chars=ascii_letters,digits length=20') }}"
+    - key: "rabbitmq_password"
+      value: "{{ lookup('password', 'rabbitmq_password chars=ascii_letters,digits length=20') }}"
+    - key: "rabbitmq_erlang_cookie"
+      value: "{{ lookup('password', 'rabbitmq_erlang_cookie chars=ascii_letters,digits length=20') }}"
+    - key: "admin_password"
+      value: "{{ password_key }}_Awx"
+    - key: "secret_key"
+      value: "{{ lookup('password', 'secret_key chars=ascii_letters,digits length=64') }}"
+    - key: "create_preload_data"
+      value: "False"
+    loop_control:
+      label: "{{ item.key }}"
+
+  - name: Run the install
+    shell: ansible-playbook -i inventory install.yml
+    args:
+      chdir: /opt/awx/installer
+
+  # Based on https://gist.github.com/mikeifomin/67e233cd461331de16707ef59a07e372
+  - name: Wait for AWX to be up
+    uri:
+      url: "http://127.0.0.1/api/"
+      follow_redirects: none
+      method: GET
+    register: _result
+    until: _result.status == 200
+    retries: 10000 # retry X times  
+    delay: 5 # pause for X sec b/w each call
+
+  - name: Create AWX Users
+    tower_user:
+      tower_host: http://127.0.0.1
+      tower_verify_ssl: no
+      tower_username: admin
+      tower_password: "{{ password_key }}_Awx"
+      username: "{{ item.key }}"
+      first_name: "{{ item.value }}"
+      last_name: "User"
+      password: "{{ password_key }}_Awx"
+      email: "{{ item.key }}@gitlab.local"
+      superuser: no
+    loop_control:
+      label: "{{ item.key }}"
+    loop: "{{ users | dict2items }}"
+
+
+  - name: Create AWX Users
+    tower_organization:
+      tower_host: http://127.0.0.1
+      tower_verify_ssl: no
+      tower_username: admin
+      tower_password: "{{ password_key }}_Awx"
+      name: "Default"
+      description: "Default"
+      state: present
+
+  - name: Create AWX Credential for Gitlab
+    tower_credential:
+      tower_host: http://127.0.0.1
+      tower_verify_ssl: no
+      tower_username: admin
+      tower_password: "{{ password_key }}_Awx"
+      name: gitlab
+      state: present
+      kind: scm
+      username: awx
+      password: "{{ password_key }}_Gitlab"
+      organization: Default
+
+  - name: Create AWX Inventory
+    tower_inventory:
+      tower_host: http://127.0.0.1
+      tower_verify_ssl: no
+      tower_username: admin
+      tower_password: "{{ password_key }}_Awx"
+      name: Fortigates
+      organization: Default
+      variables: |
+        ---
+        ansible_connection: local
+        ansible_username: admin
+        ansible_password: admin
+
+  - name: Create AWX Inventory Groups
+    tower_group:
+      tower_host: http://127.0.0.1
+      tower_verify_ssl: no
+      tower_username: admin
+      tower_password: "{{ password_key }}_Awx"
+      name: "{{ item }}"
+      inventory: Fortigates
+      instance_filters: "{{ item }}"
+    loop:
+    - internet
+    - internal
+
+  - name: Create AWX Inventory Hosts
+    tower_host:
+      tower_host: http://127.0.0.1
+      tower_verify_ssl: no
+      tower_username: admin
+      tower_password: "{{ password_key }}_Awx"
+      name: "{{ item.name }}"
+      inventory: Fortigates
+      variables: |
+        ---
+        ansible_host: {{ item.ip }}
+    loop_control:
+      label: "{{ item.name }}"
+    loop:
+    - name: internet_fw01
+      ip: 192.168.1.36
+    - name: internal_fw02
+      ip: 192.168.1.37

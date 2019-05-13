@@ -1,0 +1,7 @@
+---
+users:
+  release: Richard Release manager
+  ops: Oscar Ops Engineer
+  csa: Chris Senior Architect
+
+password_key: Sup3rSecr3t
