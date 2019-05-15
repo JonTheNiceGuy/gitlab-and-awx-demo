@@ -1,0 +1,49 @@
+---
+- name: Install Python
+  raw: test -e /usr/bin/python || (sudo apt -y update && sudo apt install -y python-minimal)
+  changed_when: false
+  failed_when: false
+
+- name: Gather facts
+  setup:
+
+- name: Run a Full Upgrade
+  apt:
+    update_cache: yes
+    upgrade: full
+    autoremove: yes
+    autoclean: yes
+    force_apt_get: yes
+
+- name: Install the Docker GPG Key
+  apt_key:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    id: 9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+
+- name: Install the Docker repo
+  apt_repository:
+    repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+    state: present
+    filename: docker-ce
+
+- name: Install required software via Apt
+  apt:
+    update_cache: yes
+    name: ['docker-ce', 'docker-ce-cli', 'containerd.io', 'python-pip', 'nodejs', 'npm']
+    force_apt_get: yes
+
+- name: Install pip packages
+  pip:
+    name: ['docker', 'docker-compose', 'ansible']
+
+- name: Install extra pip packages
+  pip:
+    name: "{{ item }}"
+  loop:
+  - ansible-tower-cli # Needed for the tower_* modules below
+
+- name: Install npm packages
+  npm:
+    name: npm
+    global: yes
+    state: latest

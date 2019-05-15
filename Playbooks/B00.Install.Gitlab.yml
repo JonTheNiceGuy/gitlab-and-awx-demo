@@ -1,0 +1,75 @@
+---
+- name: Check if Gitlab is up already
+  uri:
+    url: "http://127.0.0.1:1080/users/sign_in"
+    follow_redirects: none
+    method: GET
+  register: _result
+  failed_when: false
+  changed_when: false
+
+- name: Record status
+  set_fact:
+    build_gitlab: "{{ _result.status <100 or _result.status > 399 }}"
+
+- name: Create Gitlab Container
+  docker_container:
+    name: gitlab
+    image: gitlab/gitlab-ce:latest
+    restart: yes
+    state: started
+    published_ports:
+    - 0.0.0.0:1443:443
+    - 0.0.0.0:1080:80
+    - 0.0.0.0:2222:22
+    hostname: gitlab
+  when: build_gitlab
+
+# Based on https://gist.github.com/mikeifomin/67e233cd461331de16707ef59a07e372
+- name: Wait for gitlab to be up
+  uri:
+    url: "http://127.0.0.1:1080/users/sign_in"
+    method: GET
+  register: _result
+  until: _result.status == 200
+  retries: 240 # retry X times
+  delay: 5 # pause for X sec b/w each call
+  when: build_gitlab
+
+- name: Define initial gitlab settings (users, projects, groups)
+  set_fact:
+    # Parts of this based on:
+    # https://gitlab.com/gitlab-org/gitlab-ce/issues/58434
+    # https://github.com/rgl/gitlab-vagrant/blob/master/provision.sh#L105-L119
+    # User levels based on https://docs.gitlab.com/ee/api/members.html
+    #
+    # This block because the gitlab_* modules don't work with the current version of gitlab
+    batch_gitlab_actions: |
+      {# Root gitlab user #}
+      /opt/gitlab/bin/gitlab-rails console production <<'EOF'
+      u = User.first
+      u.password_automatically_set = false
+      u.password = '{{ password_key }}'
+      u.password_confirmation = '{{ password_key }}'
+      u.save!
+      {# Create default group #}
+      g = Group.create!(name: 'default', path: 'default')
+      p = Project.create!(namespace: g, creator: u, path: 'default', name: 'default')
+      nu = User.create!(username: \"awx\", name: \"AWX\", email: \"awx@gitlab.local\", password: \"{{ password_key }}\", password_confirmation: \"{{ password_key }}\", confirmed_at: Time.now, confirmation_token: nil)
+      g.add_user(nu, 10)
+      {# 10 = Guest level - basically read-only #}
+      g.save!
+      {% for user in users | dict2items %}
+      nu = User.create!(username: \"{{ user.key }}\", name: \"{{ user.value }}\", email: \"{{ user.key }}@gitlab.local\", password: \"{{ password_key }}\", password_confirmation: \"{{ password_key }}\", confirmed_at: Time.now, confirmation_token: nil)
+      g.add_user(nu, 50)
+      {# 50 = Owner level #}
+      g.save!
+      {% endfor %}
+      EOF
+  when: build_gitlab
+
+- name: Run gitlab config command in gitlab
+  raw: docker exec -i gitlab bash -c "{{ batch_gitlab_actions }}"
+  failed_when: docker_exec.rc != 0
+  register: docker_exec
+  when: build_gitlab
