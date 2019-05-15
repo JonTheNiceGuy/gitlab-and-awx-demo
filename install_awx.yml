@@ -74,6 +74,68 @@
     set_fact:
       build_gitlab: "{{ _result.status <100 or _result.status > 399 }}"
 
+  - name: Create Gitlab Container
+    docker_container:
+      name: gitlab
+      image: gitlab/gitlab-ce:latest
+      restart: yes
+      state: started
+      published_ports:
+      - 0.0.0.0:1443:443
+      - 0.0.0.0:1080:80
+      - 0.0.0.0:2222:22
+      hostname: gitlab
+    when: build_gitlab
+
+  # Based on https://gist.github.com/mikeifomin/67e233cd461331de16707ef59a07e372
+  - name: Wait for gitlab to be up
+    uri:
+      url: "http://127.0.0.1:1080/users/sign_in"
+      method: GET
+    register: _result
+    until: _result.status == 200
+    retries: 240 # retry X times  
+    delay: 5 # pause for X sec b/w each call
+    when: build_gitlab
+
+  - name: Define initial gitlab settings (users, projects, groups)
+    set_fact:
+      # Parts of this based on:
+      # https://gitlab.com/gitlab-org/gitlab-ce/issues/58434
+      # https://github.com/rgl/gitlab-vagrant/blob/master/provision.sh#L105-L119
+      # User levels based on https://docs.gitlab.com/ee/api/members.html
+      #
+      # This block because the gitlab_* modules don't work with the current version of gitlab
+      batch_gitlab_actions: |
+        {# Root gitlab user #}
+        /opt/gitlab/bin/gitlab-rails console production <<'EOF'
+        u = User.first
+        u.password_automatically_set = false
+        u.password = '{{ password_key }}'
+        u.password_confirmation = '{{ password_key }}'
+        u.save!
+        {# Create default group #}
+        g = Group.create!(name: 'default', path: 'default')
+        p = Project.create!(namespace: g, creator: u, path: 'default', name: 'default')
+        nu = User.create!(username: \"awx\", name: \"AWX\", email: \"awx@gitlab.local\", password: \"{{ password_key }}\", password_confirmation: \"{{ password_key }}\", confirmed_at: Time.now, confirmation_token: nil)
+        g.add_user(nu, 10)
+        {# 10 = Guest level - basically read-only #}
+        g.save!
+        {% for user in users | dict2items %}
+        nu = User.create!(username: \"{{ user.key }}\", name: \"{{ user.value }}\", email: \"{{ user.key }}@gitlab.local\", password: \"{{ password_key }}\", password_confirmation: \"{{ password_key }}\", confirmed_at: Time.now, confirmation_token: nil)
+        g.add_user(nu, 50)
+        {# 50 = Owner level #}
+        g.save!
+        {% endfor %}
+        EOF
+    when: build_gitlab
+
+  - name: Run gitlab config command in gitlab
+    raw: docker exec -i gitlab bash -c "{{ batch_gitlab_actions }}"
+    failed_when: docker_exec.rc != 0
+    register: docker_exec
+    when: build_gitlab
+
   - name: Check if AWX is up
     uri:
       url: "http://127.0.0.1"
@@ -86,19 +148,6 @@
   - name: Record status
     set_fact:
       build_awx: "{{ _result.status <100 or _result.status > 399 }}"
-
-  - name: Create Gitlab Container
-    docker_container:
-      name: gitlab
-      image: gitlab/gitlab-ce:latest
-      restart: yes
-      state: started
-      published_ports:
-      - 1443:443
-      - 1080:80
-      - 1022:22
-      hostname: gitlab
-    when: build_gitlab
 
   - name: Clone AWX repo
     git:
@@ -138,58 +187,6 @@
       chdir: /opt/awx/installer
 
   # Based on https://gist.github.com/mikeifomin/67e233cd461331de16707ef59a07e372
-  - name: Wait for gitlab to be up
-    uri:
-      url: "http://127.0.0.1:1080/users/sign_in"
-      method: GET
-    register: _result
-    until: _result.status == 200
-    retries: 10000 # retry X times  
-    delay: 5 # pause for X sec b/w each call
-    when: build_gitlab
-
-  - name: Define initial gitlab settings (users, projects, groups)
-    set_fact:
-      # Parts of this based on:
-      # https://gitlab.com/gitlab-org/gitlab-ce/issues/58434
-      # https://github.com/rgl/gitlab-vagrant/blob/master/provision.sh#L105-L119
-      # User levels based on https://docs.gitlab.com/ee/api/members.html
-      batch_gitlab_actions: |
-        {# Root gitlab user #}
-        /opt/gitlab/bin/gitlab-rails console production <<'EOF'
-        u = User.first
-        u.password_automatically_set = false
-        u.password = '{{ password_key }}'
-        u.password_confirmation = '{{ password_key }}'
-        u.save!
-        {# Create default group #}
-        g = Group.create!(name: 'default', path: 'default')
-        p = Project.create!(namespace: g, creator: u, path: 'default', name: 'default')
-        nu = User.create!(username: \"awx\", name: \"AWX\", email: \"awx@gitlab.local\", password: \"{{ password_key }}\", password_confirmation: \"{{ password_key }}\", confirmed_at: Time.now, confirmation_token: nil)
-        g.add_user(nu, 10){# Guest level - basically read-only #}
-        g.save!
-        {% for user in users | dict2items %}
-        nu = User.create!(username: \"{{ user.key }}\", name: \"{{ user.value }}\", email: \"{{ user.key }}@gitlab.local\", password: \"{{ password_key }}\", password_confirmation: \"{{ password_key }}\", confirmed_at: Time.now, confirmation_token: nil)
-        g.add_user(nu, 50){# Owner level #}
-        g.save!
-        {% endfor %}
-        EOF
-    when: build_gitlab
-
-  - name: Run gitlab config command in gitlab
-    raw: docker exec -i gitlab bash -c "{{ batch_gitlab_actions }}"
-    failed_when: docker_exec.rc != 0
-    register: docker_exec
-    when: build_gitlab
-
-  - name: Dump output
-    debug: 
-      var: docker_exec
-    when: 
-    - build_gitlab
-#    - docker_exec.rc != 0
-
-  # Based on https://gist.github.com/mikeifomin/67e233cd461331de16707ef59a07e372
   - name: Wait for AWX to be up
     uri:
       url: "http://127.0.0.1/api/"
@@ -197,7 +194,7 @@
       method: GET
     register: _result
     until: _result.status == 200
-    retries: 10000 # retry X times  
+    retries: 240 # retry X times  
     delay: 5 # pause for X sec b/w each call
 
   - name: Test tower_user access
@@ -214,8 +211,21 @@
       superuser: no
     register: _result
     until: _result.failed != True
-    retries: 10000 # retry X times  
+    retries: 240 # retry X times  
     delay: 5 # pause for X sec b/w each call
+
+  - name: Reset test
+    tower_user:
+      tower_host: http://127.0.0.1
+      tower_verify_ssl: no
+      tower_username: admin
+      tower_password: "{{ password_key }}"
+      username: "check_access"
+      first_name: "check"
+      last_name: "access"
+      password: "{{ lookup('password', '/dev/null') }}"
+      email: "check_access@gitlab.local"
+      state: absent
 
   - name: Create AWX Users
     tower_user:
@@ -225,7 +235,7 @@
       tower_password: "{{ password_key }}"
       username: "{{ item.key }}"
       first_name: "{{ item.value }}"
-      last_name: "User"
+      last_name: User
       password: "{{ password_key }}"
       email: "{{ item.key }}@gitlab.local"
       superuser: no
@@ -235,15 +245,40 @@
       label: "{{ item.key }}"
     loop: "{{ users | dict2items }}"
 
-  - name: Create AWX Users
+  - name: Create AWX Organisation
     tower_organization:
       tower_host: http://127.0.0.1
       tower_verify_ssl: no
       tower_username: admin
       tower_password: "{{ password_key }}"
-      name: "Default"
-      description: "Default"
+      name: Gitlab-AWX-Demo
+      description: Gitlab-AWX-Demo
       state: present
+
+  - name: Create AWX Team
+    tower_team:
+      tower_host: http://127.0.0.1
+      tower_verify_ssl: no
+      tower_username: admin
+      tower_password: "{{ password_key }}"
+      name: Gitlab-AWX-Demo
+      description: Gitlab-AWX-Demo
+      organization: Gitlab-AWX-Demo
+
+  - name: Create AWX Users
+    tower_role:
+      tower_host: http://127.0.0.1
+      tower_verify_ssl: no
+      tower_username: admin
+      tower_password: "{{ password_key }}"
+      user: "{{ item.key }}"
+      target_team: Gitlab-AWX-Demo
+      role: admin
+    register: _result
+    failed_when: false
+    loop_control:
+      label: "{{ item.key }}"
+    loop: "{{ users | dict2items }}"
 
   - name: Create AWX Credential for Gitlab
     tower_credential:
@@ -251,7 +286,7 @@
       tower_verify_ssl: no
       tower_username: admin
       tower_password: "{{ password_key }}"
-      name: gitlab
+      name: AWX Service Account for Gitlab
       state: present
       kind: scm
       username: awx
@@ -264,13 +299,8 @@
       tower_verify_ssl: no
       tower_username: admin
       tower_password: "{{ password_key }}"
-      name: Fortigates
-      organization: Default
-      variables: |
-        ---
-        ansible_connection: local
-        ansible_username: admin
-        ansible_password: admin
+      name: Gitlab-AWX-Demo
+      organization: Gitlab-AWX-Demo
 
   - name: Create AWX Inventory Groups
     tower_group:
@@ -279,7 +309,7 @@
       tower_username: admin
       tower_password: "{{ password_key }}"
       name: "{{ item }}"
-      inventory: Fortigates
+      inventory: Gitlab-AWX-Demo
       instance_filters: "{{ item }}"
     loop:
     - internet
@@ -291,15 +321,24 @@
       tower_verify_ssl: no
       tower_username: admin
       tower_password: "{{ password_key }}"
-      name: "{{ item.name }}"
-      inventory: Fortigates
-      variables: |
-        ---
-        ansible_host: {{ item.ip }}
+      name: "{{ item.key }}"
+      inventory: Gitlab-AWX-Demo
+      variables: "{{ item.value }}"
     loop_control:
-      label: "{{ item.name }}"
-    loop:
-    - name: internet_fw01
-      ip: 192.168.1.36
-    - name: internal_fw02
-      ip: 192.168.1.37
+      label: "{{ item.key }}"
+    loop: "{{ awx_hosts | default ({}) | dict2items }}"
+
+  - name: Create AWX Project
+    tower_project:
+      tower_host: http://127.0.0.1
+      tower_verify_ssl: no
+      tower_username: admin
+      tower_password: "{{ password_key }}"
+      name: Gitlab-AWX-Demo
+      organization: Gitlab-AWX-Demo
+      scm_type: git
+      scm_clean: yes
+      scm_delete_on_update: yes
+      scm_update_on_launch: yes
+      scm_url: http://{{ ansible_default_ipv4.address }}:1080/default/default.git
+      scm_credential: AWX Service Account for Gitlab
