@@ -7,8 +7,8 @@ The Vagrantfile works, but is quite memory constrained.
 The Ansible Playbook creates the following environment:
 
 * Services
-  * Gitlab - HTTP only, on http://<yourip>:1080
-  * AWX - HTTP only, on http://<yourip>
+  * Gitlab - HTTP only, on http://&lt;yourip&gt;:1080 (public/private interface) or on http://&lt;yourip&gt;:10080 (forwarded port)
+  * AWX - HTTP only, on http://&lt;yourip&gt; (public/private interface) or on http://&lt;yourip&gt;:11080 (forwarded port)
 * Users (Password: `Sup3rSecr3t`)
   * (Gitlab only) root - Admin account
   * (Gitlab only) awx - Service account for AWX connection
