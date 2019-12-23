@@ -22,9 +22,9 @@ Vagrant.configure("2") do |config|
 #   Pick one - Public Network (with ports 80 - AWX and 1080 - Gitlab)
 #    awx.vm.network "public_network", :use_dhcp_assigned_default_route => true
 #   Or forwarded ports, as listed below...
-    awx.vm.network "forwarded_port", guest:   80, host: 10080, protocol: "tcp"
-    awx.vm.network "forwarded_port", guest: 1080, host: 11080, protocol: "tcp"
-    awx.vm.network "forwarded_port", guest: 2222, host: 12222, protocol: "tcp"
+    awx.vm.network "forwarded_port", guest:   80, host: 10080, protocol: "tcp" # AWX HTTP
+    awx.vm.network "forwarded_port", guest: 1080, host: 11080, protocol: "tcp" # Gitlab HTTP
+    awx.vm.network "forwarded_port", guest: 2222, host: 12222, protocol: "tcp" # Gitlab SSH
     awx.vm.provider "virtualbox" do |vb|
 #     This is probably insufficient memory, but it just about works. Sometimes gitlab dies.
       vb.memory = 5120
